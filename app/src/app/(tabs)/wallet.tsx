@@ -2,6 +2,7 @@ import { useFocusEffect } from 'expo-router';
 import { useCallback, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { PhoneVerify } from '@/components/phone-verify';
 import { api, type LedgerEntry, type Wallet, type Withdrawal } from '@/lib/api';
 import { useSession } from '@/lib/session';
 import { C } from '@/lib/theme';
@@ -14,7 +15,7 @@ const METHODS: { key: Method; label: string; hint: string }[] = [
 ];
 
 export default function WalletScreen() {
-  const { wallet, config, setWallet } = useSession();
+  const { user, wallet, config, setWallet } = useSession();
   const [history, setHistory] = useState<LedgerEntry[]>([]);
   const [withdrawals, setWithdrawals] = useState<Withdrawal[]>([]);
   const [method, setMethod] = useState<Method>('mobile_money');
@@ -40,9 +41,10 @@ export default function WalletScreen() {
     setBusy(true);
     try {
       const amountUsd = Number(form.amount);
+      const accountNumber = method === 'mobile_money' ? (user?.phone ?? '').replace(/\D/g, '') : form.accountNumber.trim();
       const details = method === 'paypal'
         ? { email: form.email.trim() }
-        : { accountName: form.accountName.trim(), accountNumber: form.accountNumber.trim(), bankCode: form.bankCode.trim().toUpperCase(), currency: form.currency.trim().toUpperCase() };
+        : { accountName: form.accountName.trim(), accountNumber, bankCode: form.bankCode.trim().toUpperCase(), currency: form.currency.trim().toUpperCase() };
       const r = await api<{ withdrawal: Withdrawal; wallet: Wallet }>('/withdrawals', { body: { method, amountUsd, details } });
       setWallet(r.wallet);
       setMsg({ ok: true, text: `Withdrawal of $${r.withdrawal.amount_usd.toFixed(2)} ${r.withdrawal.status.replace('_', ' ')}` });
@@ -66,6 +68,8 @@ export default function WalletScreen() {
         </View>
 
         <Text style={styles.h2}>Cash out</Text>
+        {!user?.phone_verified ? <PhoneVerify /> : (<>
+        <Text style={[styles.muted, { marginBottom: 10 }]}>Verified phone: {user.phone}</Text>
         <View style={styles.methods}>
           {METHODS.map((m) => (
             <Pressable key={m.key} onPress={() => setMethod(m.key)} style={[styles.method, method === m.key && styles.methodOn]}>
@@ -81,13 +85,11 @@ export default function WalletScreen() {
         ) : (
           <>
             <Field label="Account holder name" value={form.accountName} onChangeText={set('accountName')} placeholder="Jane Doe" />
-            <Field
-              label={method === 'mobile_money' ? 'Phone number (with country code)' : 'Account number'}
-              value={form.accountNumber}
-              onChangeText={set('accountNumber')}
-              keyboardType="number-pad"
-              placeholder={method === 'mobile_money' ? '255712345678' : '0123456789'}
-            />
+            {method === 'mobile_money' ? (
+              <Field label="Mobile money number (your verified phone)" value={user.phone ?? ''} editable={false} style={[styles.input, { opacity: 0.6 }]} />
+            ) : (
+              <Field label="Account number" value={form.accountNumber} onChangeText={set('accountNumber')} keyboardType="number-pad" placeholder="0123456789" />
+            )}
             <Field
               label={method === 'mobile_money' ? 'Network code (e.g. MPS for M-Pesa)' : 'Bank code'}
               value={form.bankCode}
@@ -101,6 +103,7 @@ export default function WalletScreen() {
           {busy ? <ActivityIndicator color="#000" /> : <Text style={styles.ctaText}>Request payout</Text>}
         </Pressable>
         {msg && <Text style={{ color: msg.ok ? C.accent : C.danger, marginTop: 8 }}>{msg.text}</Text>}
+        </>)}
 
         {withdrawals.length > 0 && (
           <>
@@ -125,7 +128,7 @@ function Field({ label, ...props }: { label: string } & React.ComponentProps<typ
   return (
     <View style={{ marginTop: 12 }}>
       <Text style={styles.label}>{label}</Text>
-      <TextInput {...props} autoCapitalize="none" placeholderTextColor="#555" style={styles.input} />
+      <TextInput autoCapitalize="none" placeholderTextColor="#555" style={styles.input} {...props} />
     </View>
   );
 }

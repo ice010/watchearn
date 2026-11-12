@@ -7,6 +7,13 @@ app/     Expo SDK 58 app (Expo Router): Watch feed, Shorts, Wallet, Account
 server/  Express API: auth, points ledger, AdMob SSV rewards, withdrawals, payouts
 ```
 
+## Accounts and verification
+
+- **Sign-up:** the user must enter a 6-digit code that is emailed to them. No token is issued until `POST /api/auth/verify-email` succeeds. Signing in with an unverified email sends a new code.
+- **Before the first withdrawal:** the user must verify a phone number (international format, e.g. `+255712345678`) with a code sent by **WhatsApp or SMS**. Each number can be verified on only one account, and mobile-money payouts go only to the verified number.
+- **Codes:** each code expires after 10 minutes and allows at most 5 attempts. A new code can be requested after 60 seconds. Codes are stored as HMAC hashes, not plain text.
+- **Sandbox (`MESSAGING_MODE=sandbox`):** codes are not sent. They are logged on the server and shown in the app so you can test the flow.
+
 ## How earning works
 
 1. Every video starts with a **rewarded ad** (Google AdMob on iPhone).
@@ -47,6 +54,8 @@ EXPO_PUBLIC_API_URL=https://api.your-domain.com/api npx eas-cli@latest build --p
 | Replace test IDs: `iosAppId` in `app.json`; set `EXPO_PUBLIC_ADMOB_REWARDED_IOS` and `EXPO_PUBLIC_API_URL` at build time | `app/` |
 | Deploy server over HTTPS with a persistent disk (or move to Postgres for multi-instance) | any host |
 | Set `JWT_SECRET`, `ADMIN_TOKEN`, `PUBLIC_URL`, `SANDBOX_REWARDS=false`, `PAYOUT_MODE=live` | `server/.env` (see `.env.example`) |
+| Resend account with a verified sending domain → `RESEND_API_KEY`, `EMAIL_FROM`; set `MESSAGING_MODE=live` | resend.com |
+| Twilio account → `TWILIO_ACCOUNT_SID/AUTH_TOKEN`, SMS number `TWILIO_SMS_FROM`, WhatsApp sender `TWILIO_WHATSAPP_FROM` + approved authentication template `TWILIO_WHATSAPP_CONTENT_SID` | Twilio console |
 | Flutterwave business account (KYC) → `FLW_SECRET_KEY`, `FLW_WEBHOOK_HASH`; webhook `…/api/webhooks/flutterwave` | Flutterwave dashboard |
 | PayPal business account with Payouts enabled → `PAYPAL_CLIENT_ID/SECRET`, `PAYPAL_BASE_URL=https://api-m.paypal.com` | PayPal developer |
 | Terms, privacy policy, age limit (18+), tax/KYC rules for each country you pay out to | legal |

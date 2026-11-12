@@ -5,8 +5,8 @@ const config = require('./config');
 const { openDb } = require('./db');
 const { createApp } = require('./app');
 
-if (process.env.NODE_ENV === 'production' && (config.jwtSecret === 'dev-only-change-me' || config.sandboxRewards)) {
-  console.error('Refusing to start: set JWT_SECRET and SANDBOX_REWARDS=false in production.');
+if (process.env.NODE_ENV === 'production' && (config.jwtSecret === 'dev-only-change-me' || config.sandboxRewards || config.messagingMode !== 'live')) {
+  console.error('Refusing to start: set JWT_SECRET, SANDBOX_REWARDS=false and MESSAGING_MODE=live in production.');
   process.exit(1);
 }
 

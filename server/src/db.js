@@ -14,6 +14,9 @@ function openDb(file) {
       password_hash TEXT NOT NULL,
       name TEXT,
       country TEXT,
+      email_verified INTEGER NOT NULL DEFAULT 0,
+      phone TEXT,
+      phone_verified_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     -- Append-only points ledger. Balance = SUM(delta). (kind, ref) dedupes ad callbacks.
@@ -41,7 +44,25 @@ function openDb(file) {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS verification_codes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      purpose TEXT NOT NULL, -- 'email' | 'phone'
+      target TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS verification_user ON verification_codes(user_id, purpose, id);
   `);
+  // Columns added after the first release.
+  const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+  if (!cols.includes('email_verified')) db.exec('ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0');
+  if (!cols.includes('phone')) db.exec('ALTER TABLE users ADD COLUMN phone TEXT');
+  if (!cols.includes('phone_verified_at')) db.exec('ALTER TABLE users ADD COLUMN phone_verified_at TEXT');
   return db;
 }
 

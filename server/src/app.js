@@ -8,8 +8,14 @@ const { z } = require('zod');
 const { catalog } = require('./catalog');
 const { verifySsv } = require('./admobSsv');
 const { sendPayout } = require('./payouts');
+const { sendCode } = require('./messaging');
 
-function createApp({ db, config, keyProvider, payout = sendPayout }) {
+const CODE_TTL_MIN = 10;
+const CODE_MAX_ATTEMPTS = 5;
+const RESEND_COOLDOWN_SEC = 60;
+const E164 = /^\+[1-9]\d{7,14}$/;
+
+function createApp({ db, config, keyProvider, payout = sendPayout, messenger = sendCode }) {
   const app = express();
   app.set('trust proxy', 1);
   app.use(cors());
@@ -17,7 +23,14 @@ function createApp({ db, config, keyProvider, payout = sendPayout }) {
 
   const q = {
     userByEmail: db.prepare('SELECT * FROM users WHERE email = ?'),
-    userById: db.prepare('SELECT id, email, name, country, created_at FROM users WHERE id = ?'),
+    userById: db.prepare('SELECT id, email, name, country, email_verified, phone, phone_verified_at, created_at FROM users WHERE id = ?'),
+    setEmailVerified: db.prepare('UPDATE users SET email_verified = 1 WHERE id = ?'),
+    setPhone: db.prepare(`UPDATE users SET phone = ?, phone_verified_at = datetime('now') WHERE id = ?`),
+    phoneOwner: db.prepare('SELECT id FROM users WHERE phone = ? AND phone_verified_at IS NOT NULL AND id != ?'),
+    insertCode: db.prepare(`INSERT INTO verification_codes (user_id, purpose, target, channel, code_hash, expires_at) VALUES (?, ?, ?, ?, ?, datetime('now', '+${CODE_TTL_MIN} minutes'))`),
+    latestCode: db.prepare(`SELECT *, expires_at > datetime('now') AS fresh, created_at > datetime('now', '-${RESEND_COOLDOWN_SEC} seconds') AS recent FROM verification_codes WHERE user_id = ? AND purpose = ? ORDER BY id DESC LIMIT 1`),
+    bumpAttempts: db.prepare('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?'),
+    useCode: db.prepare(`UPDATE verification_codes SET used_at = datetime('now') WHERE id = ?`),
     insertUser: db.prepare('INSERT INTO users (email, password_hash, name, country) VALUES (?, ?, ?, ?)'),
     balance: db.prepare('SELECT COALESCE(SUM(delta), 0) AS points FROM ledger WHERE user_id = ?'),
     adsToday: db.prepare(`SELECT COUNT(*) AS n FROM ledger WHERE user_id = ? AND kind IN ('ad', 'sandbox_ad') AND created_at >= datetime('now', 'start of day')`),
@@ -31,6 +44,10 @@ function createApp({ db, config, keyProvider, payout = sendPayout }) {
     setWithdrawal: db.prepare(`UPDATE withdrawals SET status = ?, provider_ref = COALESCE(?, provider_ref), error = ?, updated_at = datetime('now') WHERE id = ?`),
   };
 
+  const publicUser = (u) => u && ({
+    id: u.id, email: u.email, name: u.name, country: u.country,
+    email_verified: !!u.email_verified, phone: u.phone, phone_verified: !!u.phone_verified_at,
+  });
   const sign = (user) => jwt.sign({ sub: user.id }, config.jwtSecret, { expiresIn: '30d' });
   const usd = (points) => Math.floor((points / config.pointsPerUsd) * 100) / 100;
   const summary = (userId) => {
@@ -42,12 +59,51 @@ function createApp({ db, config, keyProvider, payout = sendPayout }) {
     const token = (req.headers.authorization || '').replace(/^Bearer /, '');
     try {
       req.userId = jwt.verify(token, config.jwtSecret).sub;
-      if (!q.userById.get(req.userId)) throw new Error('no user');
-      next();
+      req.user = q.userById.get(req.userId);
+      if (!req.user) throw new Error('no user');
     } catch {
-      res.status(401).json({ error: 'Unauthorized' });
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!req.user.email_verified) return res.status(403).json({ error: 'Verify your email first', verificationRequired: true });
+    next();
+  }
+
+  const hashCode = (userId, purpose, code) =>
+    crypto.createHmac('sha256', config.jwtSecret).update(`${userId}:${purpose}:${code}`).digest('hex');
+
+  // Creates and delivers a 6-digit code. Throws { status, message } on cooldown/provider errors.
+  async function issueCode(userId, purpose, channel, target) {
+    const last = q.latestCode.get(userId, purpose);
+    if (last && last.recent && !last.used_at) {
+      const err = new Error(`Please wait ${RESEND_COOLDOWN_SEC} seconds before requesting another code`);
+      err.status = 429;
+      throw err;
+    }
+    const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+    q.insertCode.run(userId, purpose, target, channel, hashCode(userId, purpose, code));
+    try {
+      const r = await messenger(config, channel, target, code);
+      return r.sandbox ? { sentTo: target, channel, devCode: code } : { sentTo: target, channel };
+    } catch (e) {
+      const err = new Error(`Could not send code: ${e.message}`);
+      err.status = 502;
+      throw err;
     }
   }
+
+  function checkCode(userId, purpose, code) {
+    const c = q.latestCode.get(userId, purpose);
+    if (!c || c.used_at) return { ok: false, error: 'Request a new code' };
+    if (!c.fresh) return { ok: false, error: 'Code expired. Request a new one' };
+    if (c.attempts >= CODE_MAX_ATTEMPTS) return { ok: false, error: 'Too many attempts. Request a new code' };
+    q.bumpAttempts.run(c.id);
+    const a = Buffer.from(hashCode(userId, purpose, String(code || '')));
+    if (!crypto.timingSafeEqual(a, Buffer.from(c.code_hash))) return { ok: false, error: 'Wrong code' };
+    q.useCode.run(c.id);
+    return { ok: true, target: c.target };
+  }
+
+  const sendErr = (res, e) => res.status(e.status || 500).json({ error: e.message });
 
   function admin(req, res, next) {
     const t = req.headers['x-admin-token'] || '';
@@ -88,6 +144,7 @@ function createApp({ db, config, keyProvider, payout = sendPayout }) {
     maxAdsPerDay: config.maxAdsPerDay,
     sandboxRewards: config.sandboxRewards,
     payoutMode: config.payoutMode,
+    messagingMode: config.messagingMode,
     payoutMethods: ['paypal', 'bank', 'mobile_money'],
   }));
 
@@ -99,23 +156,78 @@ function createApp({ db, config, keyProvider, payout = sendPayout }) {
     country: z.string().max(2).optional(),
   });
 
-  app.post('/auth/register', authLimiter, (req, res) => {
+  // Registration creates an unverified account and emails a code; a token is only issued after /auth/verify-email.
+  app.post('/auth/register', authLimiter, async (req, res) => {
     const p = credentials.safeParse(req.body);
     if (!p.success) return res.status(400).json({ error: 'Valid email and 8+ character password required' });
     if (q.userByEmail.get(p.data.email)) return res.status(409).json({ error: 'Email already registered' });
     const r = q.insertUser.run(p.data.email, bcrypt.hashSync(p.data.password, 10), p.data.name || null, p.data.country || null);
-    const user = q.userById.get(r.lastInsertRowid);
-    res.status(201).json({ token: sign(user), user });
+    try {
+      res.status(201).json({ verificationRequired: true, ...(await issueCode(r.lastInsertRowid, 'email', 'email', p.data.email)) });
+    } catch (e) {
+      sendErr(res, e);
+    }
   });
 
-  app.post('/auth/login', authLimiter, (req, res) => {
+  app.post('/auth/login', authLimiter, async (req, res) => {
     const p = credentials.pick({ email: true, password: true }).safeParse(req.body);
     const u = p.success && q.userByEmail.get(p.data.email);
     if (!u || !bcrypt.compareSync(p.data.password, u.password_hash)) return res.status(401).json({ error: 'Wrong email or password' });
-    res.json({ token: sign(u), user: q.userById.get(u.id) });
+    if (!u.email_verified) {
+      const sent = await issueCode(u.id, 'email', 'email', u.email).catch(() => ({ sentTo: u.email }));
+      return res.status(403).json({ error: 'Verify your email to continue', verificationRequired: true, ...sent });
+    }
+    res.json({ token: sign(u), user: publicUser(q.userById.get(u.id)) });
   });
 
-  app.get('/me', auth, (req, res) => res.json({ user: q.userById.get(req.userId), wallet: summary(req.userId) }));
+  const codeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20 });
+  app.post('/auth/verify-email', codeLimiter, (req, res) => {
+    const email = String(req.body.email || '').toLowerCase();
+    const u = q.userByEmail.get(email);
+    if (!u) return res.status(400).json({ error: 'Wrong code' });
+    if (!u.email_verified) {
+      const c = checkCode(u.id, 'email', req.body.code);
+      if (!c.ok) return res.status(400).json({ error: c.error });
+      q.setEmailVerified.run(u.id);
+    } else {
+      return res.status(400).json({ error: 'Email already verified. Sign in instead' });
+    }
+    res.json({ token: sign(u), user: publicUser(q.userById.get(u.id)) });
+  });
+
+  app.post('/auth/resend-code', codeLimiter, async (req, res) => {
+    const u = q.userByEmail.get(String(req.body.email || '').toLowerCase());
+    if (!u || u.email_verified) return res.json({ ok: true });
+    try {
+      res.json({ ok: true, ...(await issueCode(u.id, 'email', 'email', u.email)) });
+    } catch (e) {
+      sendErr(res, e);
+    }
+  });
+
+  app.get('/me', auth, (req, res) => res.json({ user: publicUser(req.user), wallet: summary(req.userId) }));
+
+  // Phone verification (required before withdrawing). Code goes out by SMS or WhatsApp.
+  const phoneLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, keyGenerator: (req) => String(req.userId) });
+  app.post('/phone/start', auth, phoneLimiter, async (req, res) => {
+    const phone = String(req.body.phone || '').replace(/[\s()-]/g, '');
+    const channel = req.body.channel === 'whatsapp' ? 'whatsapp' : 'sms';
+    if (!E164.test(phone)) return res.status(400).json({ error: 'Enter the number in international format, e.g. +255712345678' });
+    if (q.phoneOwner.get(phone, req.userId)) return res.status(409).json({ error: 'This number is already verified on another account' });
+    try {
+      res.json(await issueCode(req.userId, 'phone', channel, phone));
+    } catch (e) {
+      sendErr(res, e);
+    }
+  });
+
+  app.post('/phone/verify', auth, phoneLimiter, (req, res) => {
+    const c = checkCode(req.userId, 'phone', req.body.code);
+    if (!c.ok) return res.status(400).json({ error: c.error });
+    if (q.phoneOwner.get(c.target, req.userId)) return res.status(409).json({ error: 'This number is already verified on another account' });
+    q.setPhone.run(c.target, req.userId);
+    res.json({ user: publicUser(q.userById.get(req.userId)) });
+  });
 
   app.get('/videos', (req, res) => {
     const type = req.query.type;
@@ -170,6 +282,12 @@ function createApp({ db, config, keyProvider, payout = sendPayout }) {
     const p = withdrawalSchema.safeParse(req.body);
     if (!p.success) return res.status(400).json({ error: 'Invalid withdrawal details', issues: p.error.issues });
     const { method, amountUsd, details } = p.data;
+    if (!req.user.phone_verified_at) {
+      return res.status(403).json({ error: 'Verify your phone number before withdrawing', phoneVerificationRequired: true });
+    }
+    if (method === 'mobile_money' && details.accountNumber.replace(/\D/g, '') !== req.user.phone.replace(/\D/g, '')) {
+      return res.status(400).json({ error: 'Mobile money payouts can only go to your verified phone number' });
+    }
     if (amountUsd < config.minWithdrawUsd) return res.status(400).json({ error: `Minimum withdrawal is $${config.minWithdrawUsd}` });
     const points = Math.round(amountUsd * config.pointsPerUsd);
 

@@ -20,13 +20,70 @@ const baseConfig = {
   flutterwave: {}, paypal: {},
 };
 
+const sent = [];
+const messenger = async (_cfg, channel, target, code) => { sent.push({ channel, target, code }); return { sandbox: true }; };
+
+async function signup(a, email) {
+  const r = await request(a).post('/auth/register').send({ email, password: 'password123' });
+  const v = await request(a).post('/auth/verify-email').send({ email, code: r.body.devCode });
+  return v.body;
+}
+async function verifyPhone(a, tok, phone = '+255712345678') {
+  const s = await request(a).post('/phone/start').set('Authorization', `Bearer ${tok}`).send({ phone, channel: 'whatsapp' });
+  return request(a).post('/phone/verify').set('Authorization', `Bearer ${tok}`).send({ code: s.body.devCode });
+}
+
 let app, token, userId;
 beforeEach(async () => {
-  app = createApp({ db: openDb(':memory:'), config: { ...baseConfig }, keyProvider });
-  const r = await request(app).post('/auth/register').send({ email: 'A@b.com', password: 'password123' });
-  token = r.body.token; userId = r.body.user.id;
+  sent.length = 0;
+  app = createApp({ db: openDb(':memory:'), config: { ...baseConfig }, keyProvider, messenger });
+  const r = await signup(app, 'A@b.com');
+  token = r.token; userId = r.user.id;
 });
 const authed = (req) => req.set('Authorization', `Bearer ${token}`);
+
+describe('email verification', () => {
+  it('requires the emailed code before issuing a token', async () => {
+    const r = await request(app).post('/auth/register').send({ email: 'new@x.com', password: 'password123' });
+    expect(r.status).toBe(201);
+    expect(r.body.token).toBeUndefined();
+    expect(sent.at(-1)).toMatchObject({ channel: 'email', target: 'new@x.com', code: r.body.devCode });
+
+    const login = await request(app).post('/auth/login').send({ email: 'new@x.com', password: 'password123' });
+    expect(login.status).toBe(403);
+    expect(login.body.verificationRequired).toBe(true);
+
+    const wrong = r.body.devCode === '000000' ? '111111' : '000000';
+    expect((await request(app).post('/auth/verify-email').send({ email: 'new@x.com', code: wrong })).body.error).toBe('Wrong code');
+    const ok = await request(app).post('/auth/verify-email').send({ email: 'new@x.com', code: r.body.devCode });
+    expect(ok.status).toBe(200);
+    expect(ok.body.user.email_verified).toBe(true);
+    expect((await request(app).get('/me').set('Authorization', `Bearer ${ok.body.token}`)).status).toBe(200);
+  });
+
+  it('locks a code after 5 wrong attempts and rate-limits resends', async () => {
+    const r = await request(app).post('/auth/register').send({ email: 'lock@x.com', password: 'password123' });
+    const wrong = r.body.devCode === '000000' ? '111111' : '000000';
+    for (let i = 0; i < 5; i++) await request(app).post('/auth/verify-email').send({ email: 'lock@x.com', code: wrong });
+    const v = await request(app).post('/auth/verify-email').send({ email: 'lock@x.com', code: r.body.devCode });
+    expect(v.body.error).toMatch(/Too many attempts/);
+    expect((await request(app).post('/auth/resend-code').send({ email: 'lock@x.com' })).status).toBe(429);
+  });
+});
+
+describe('phone verification', () => {
+  it('verifies a phone by WhatsApp/SMS code and blocks reuse on another account', async () => {
+    const bad = await authed(request(app).post('/phone/start')).send({ phone: '0712345678', channel: 'sms' });
+    expect(bad.status).toBe(400);
+    const v = await verifyPhone(app, token);
+    expect(v.body.user).toMatchObject({ phone: '+255712345678', phone_verified: true });
+    expect(sent.at(-1).channel).toBe('whatsapp');
+
+    const other = await signup(app, 'other@x.com');
+    const s = await request(app).post('/phone/start').set('Authorization', `Bearer ${other.token}`).send({ phone: '+255712345678' });
+    expect(s.status).toBe(409);
+  });
+});
 
 describe('auth', () => {
   it('logs in and rejects bad password', async () => {
@@ -55,8 +112,21 @@ describe('AdMob SSV', () => {
 describe('withdrawals', () => {
   async function earn(n) { for (let i = 0; i < n; i++) await request(app).get(`/admob/ssv?${ssvQuery(userId, `t${i}`)}`); }
 
+  it('requires a verified phone, and mobile money must go to that phone', async () => {
+    await earn(2);
+    const details = { accountName: 'Jane Doe', accountNumber: '255700000000', bankCode: 'MPS', currency: 'TZS' };
+    const r = await authed(request(app).post('/withdrawals')).send({ method: 'mobile_money', amountUsd: 1, details });
+    expect(r.status).toBe(403);
+    expect(r.body.phoneVerificationRequired).toBe(true);
+    await verifyPhone(app, token);
+    expect((await authed(request(app).post('/withdrawals')).send({ method: 'mobile_money', amountUsd: 1, details })).status).toBe(400);
+    const ok = await authed(request(app).post('/withdrawals')).send({ method: 'mobile_money', amountUsd: 1, details: { ...details, accountNumber: '255712345678' } });
+    expect(ok.status).toBe(201);
+  });
+
   it('holds points, then pays on admin approval', async () => {
-    await earn(2); // 1000 pts = $1
+    await earn(2);
+    await verifyPhone(app, token); // 1000 pts = $1
     const w = await authed(request(app).post('/withdrawals')).send({ method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } });
     expect(w.status).toBe(201);
     expect(w.body.withdrawal.status).toBe('pending_review');
@@ -67,7 +137,8 @@ describe('withdrawals', () => {
 
   it('rejects insufficient balance and refunds rejected withdrawals', async () => {
     await earn(2);
-    const details = { accountName: 'Jane Doe', accountNumber: '255700000000', bankCode: 'MPS', currency: 'TZS' };
+    await verifyPhone(app, token);
+    const details = { accountName: 'Jane Doe', accountNumber: '255712345678', bankCode: 'MPS', currency: 'TZS' };
     expect((await authed(request(app).post('/withdrawals')).send({ method: 'mobile_money', amountUsd: 2, details })).body.error).toBe('Insufficient balance');
     const w = await authed(request(app).post('/withdrawals')).send({ method: 'mobile_money', amountUsd: 1, details });
     await request(app).post(`/admin/withdrawals/${w.body.withdrawal.id}/reject`).set('x-admin-token', 'admintoken').send({ reason: 'test' });
@@ -75,8 +146,9 @@ describe('withdrawals', () => {
   });
 
   it('refunds when the provider fails', async () => {
-    const failing = createApp({ db: openDb(':memory:'), config: { ...baseConfig, autoApproveWithdrawals: true }, keyProvider, payout: async () => { throw new Error('boom'); } });
-    const r = await request(failing).post('/auth/register').send({ email: 'c@d.com', password: 'password123' });
+    const failing = createApp({ db: openDb(':memory:'), config: { ...baseConfig, autoApproveWithdrawals: true }, keyProvider, messenger, payout: async () => { throw new Error('boom'); } });
+    const r = { body: await signup(failing, 'c@d.com') };
+    await verifyPhone(failing, r.body.token);
     for (const t of ['x', 'y']) await request(failing).get(`/admob/ssv?${ssvQuery(r.body.user.id, t)}`);
     const w = await request(failing).post('/withdrawals').set('Authorization', `Bearer ${r.body.token}`).send({ method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } });
     expect(w.body.withdrawal.status).toBe('failed');

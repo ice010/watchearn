@@ -23,6 +23,20 @@ const config = {
   payoutMode: process.env.PAYOUT_MODE || 'sandbox',
   autoApproveWithdrawals: bool(process.env.AUTO_APPROVE_WITHDRAWALS, false),
 
+  // sandbox = verification codes are logged and returned to the client; live = sent by email/SMS/WhatsApp.
+  messagingMode: process.env.MESSAGING_MODE || 'sandbox',
+  email: {
+    resendApiKey: process.env.RESEND_API_KEY || '',
+    from: process.env.EMAIL_FROM || 'WatchEarn <no-reply@your-domain.com>',
+  },
+  twilio: {
+    accountSid: process.env.TWILIO_ACCOUNT_SID || '',
+    authToken: process.env.TWILIO_AUTH_TOKEN || '',
+    smsFrom: process.env.TWILIO_SMS_FROM || '',
+    whatsappFrom: process.env.TWILIO_WHATSAPP_FROM || '',
+    whatsappContentSid: process.env.TWILIO_WHATSAPP_CONTENT_SID || '',
+  },
+
   flutterwave: {
     secretKey: process.env.FLW_SECRET_KEY || '',
     webhookHash: process.env.FLW_WEBHOOK_HASH || '',

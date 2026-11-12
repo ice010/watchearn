@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
-import { api, setToken, type AppConfig, type User, type Wallet } from './api';
+import { api, ApiError, setToken, type AppConfig, type CodeSent, type User, type Wallet } from './api';
 import { storage } from './storage';
 
 type Session = {
@@ -7,8 +7,12 @@ type Session = {
   user: User | null;
   wallet: Wallet | null;
   config: AppConfig | null;
-  login: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string, name?: string) => Promise<void>;
+  /** Resolves to a CodeSent when the email still needs verifying. */
+  login: (email: string, password: string) => Promise<CodeSent | null>;
+  register: (email: string, password: string, name?: string) => Promise<CodeSent>;
+  verifyEmail: (email: string, code: string) => Promise<void>;
+  resendCode: (email: string) => Promise<CodeSent>;
+  setUser: (u: User) => void;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
   setWallet: (w: Wallet) => void;
@@ -58,9 +62,20 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     wallet,
     config,
     setWallet,
+    setUser,
     refresh,
-    login: (email, password) => start('/auth/login', { email, password }),
-    register: (email, password, name) => start('/auth/register', { email, password, name }),
+    login: async (email, password) => {
+      try {
+        await start('/auth/login', { email, password });
+        return null;
+      } catch (e) {
+        if (e instanceof ApiError && e.data.verificationRequired) return e.data as unknown as CodeSent;
+        throw e;
+      }
+    },
+    register: (email, password, name) => api<CodeSent>('/auth/register', { body: { email, password, name } }),
+    verifyEmail: (email, code) => start('/auth/verify-email', { email, code }),
+    resendCode: (email) => api<CodeSent>('/auth/resend-code', { body: { email } }),
     logout: async () => {
       setToken(null);
       await storage.remove(KEY);
