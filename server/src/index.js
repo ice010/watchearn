@@ -12,6 +12,12 @@ if (process.env.NODE_ENV === 'production' && (config.jwtSecret === 'dev-only-cha
 
 const api = createApp({ db: openDb(config.dbPath), config });
 const root = express();
+if (process.env.LOG_REQUESTS) {
+  root.use((req, res, next) => {
+    res.on('finish', () => console.log(res.statusCode, req.method, req.originalUrl));
+    next();
+  });
+}
 // API lives under /api so the web build can be served from the same origin.
 root.use('/api', api);
 

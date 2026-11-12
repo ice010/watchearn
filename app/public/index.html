@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta httpEquiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <meta name="theme-color" content="#0B0B12" />
+    <title>%WEB_TITLE%</title>
+    <style id="expo-reset">
+      html, body { height: 100%; background: #0B0B12; color: #fff; }
+      body { overflow: hidden; margin: 0; font-family: -apple-system, system-ui, sans-serif; }
+      #root { display: flex; height: 100%; flex: 1; }
+      #boot { margin: auto; text-align: center; opacity: .8; padding: 24px; }
+    </style>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"><div id="boot">Loading WatchEarn…</div></div>
+    <script>
+      window.addEventListener('error', function (e) {
+        var b = document.getElementById('boot');
+        if (b) b.textContent = 'Failed to load: ' + (e.message || (e.target && e.target.src) || 'unknown error');
+      }, true);
+    </script>
+  </body>
+</html>
