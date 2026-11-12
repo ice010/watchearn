@@ -18,7 +18,7 @@ function ssvQuery(userId, txn) {
 const baseConfig = {
   jwtSecret: 'test', adminToken: 'admintoken', publicUrl: 'http://x',
   pointsPerAd: 500, pointsPerUsd: 1000, minWithdrawUsd: 1, maxAdsPerDay: 3,
-  sandboxRewards: true, payoutMode: 'sandbox', autoApproveWithdrawals: false,
+  sandboxRewards: true, payoutMode: 'sandbox',
   flutterwave: {}, paypal: {},
   kycDir: path.join(os.tmpdir(), `watchearn-kyc-${process.pid}`),
 };
@@ -41,6 +41,11 @@ async function passKyc(a, tok, over) {
   const id = (await request(a).get('/admin/kyc').set('x-admin-token', 'admintoken')).body.submissions.at(-1).id;
   await request(a).post(`/admin/kyc/${id}/approve`).set('x-admin-token', 'admintoken');
   return s;
+}
+async function withdraw(a, tok, body) {
+  const start = await request(a).post('/withdrawals').set('Authorization', `Bearer ${tok}`).send(body);
+  if (start.status !== 202) return start;
+  return request(a).post('/withdrawals').set('Authorization', `Bearer ${tok}`).send({ ...body, code: start.body.devCode });
 }
 async function verifyPhone(a, tok, phone = '+255712345678') {
   const s = await request(a).post('/phone/start').set('Authorization', `Bearer ${tok}`).send({ phone, channel: 'whatsapp' });
@@ -120,7 +125,7 @@ describe('identity verification (KYC)', () => {
 
     await request(app).post(`/admin/kyc/${list[0].id}/approve`).set('x-admin-token', 'admintoken');
     expect((await authed(request(app).get('/me'))).body.user.kyc_status).toBe('approved');
-    expect((await authed(request(app).post('/withdrawals')).send({ method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } })).status).toBe(201);
+    expect((await withdraw(app, token, { method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } })).status).toBe(201);
   });
 
   it('checks submitted details against other accounts', async () => {
@@ -211,40 +216,51 @@ describe('withdrawals', () => {
     expect(r.body.phoneVerificationRequired).toBe(true);
     await verifyPhone(app, token);
     expect((await authed(request(app).post('/withdrawals')).send({ method: 'mobile_money', amountUsd: 1, details })).status).toBe(400);
-    const ok = await authed(request(app).post('/withdrawals')).send({ method: 'mobile_money', amountUsd: 1, details: { ...details, accountNumber: '255712345678' } });
+    const ok = await withdraw(app, token, { method: 'mobile_money', amountUsd: 1, details: { ...details, accountNumber: '255712345678' } });
     expect(ok.status).toBe(201);
   });
 
-  it('holds points, then pays on admin approval', async () => {
+  it('sends an OTP to the verified phone, then pays automatically once confirmed', async () => {
     await earn(2);
     await passKyc(app, token);
     await verifyPhone(app, token); // 1000 pts = $1
-    const w = await authed(request(app).post('/withdrawals')).send({ method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } });
+    const body = { method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } };
+    const start = await authed(request(app).post('/withdrawals')).send({ ...body, channel: 'whatsapp' });
+    expect(start.status).toBe(202);
+    expect(start.body).toMatchObject({ otpRequired: true, channel: 'whatsapp', sentTo: '+255•••••678' });
+    expect(sent.at(-1)).toMatchObject({ channel: 'whatsapp', target: '+255712345678' });
+    expect((await authed(request(app).get('/me'))).body.wallet.points).toBe(1000);
+
+    expect((await authed(request(app).post('/withdrawals')).send({ ...body, code: '000000' })).body.error).toMatch(/Wrong code/);
+    // The code only confirms the exact request it was sent for.
+    const swapped = await authed(request(app).post('/withdrawals')).send({ ...body, details: { email: 'thief@y.com' }, code: start.body.devCode });
+    expect(swapped.status).toBe(400);
+
+    const w = await authed(request(app).post('/withdrawals')).send({ ...body, code: start.body.devCode });
     expect(w.status).toBe(201);
-    expect(w.body.withdrawal.status).toBe('pending_review');
+    expect(w.body.withdrawal.status).toBe('paid');
     expect(w.body.wallet.points).toBe(0);
-    const a = await request(app).post(`/admin/withdrawals/${w.body.withdrawal.id}/approve`).set('x-admin-token', 'admintoken');
-    expect(a.body.withdrawal.status).toBe('paid');
+    // Codes are single-use.
+    expect((await authed(request(app).post('/withdrawals')).send({ ...body, code: start.body.devCode })).status).toBe(400);
   });
 
-  it('rejects insufficient balance and refunds rejected withdrawals', async () => {
+  it('rejects insufficient balance before sending a code', async () => {
     await earn(2);
     await passKyc(app, token);
     await verifyPhone(app, token);
     const details = { accountName: 'Jane Doe', accountNumber: '255712345678', bankCode: 'MPS', currency: 'TZS' };
+    const n = sent.length;
     expect((await authed(request(app).post('/withdrawals')).send({ method: 'mobile_money', amountUsd: 2, details })).body.error).toBe('Insufficient balance');
-    const w = await authed(request(app).post('/withdrawals')).send({ method: 'mobile_money', amountUsd: 1, details });
-    await request(app).post(`/admin/withdrawals/${w.body.withdrawal.id}/reject`).set('x-admin-token', 'admintoken').send({ reason: 'test' });
-    expect((await authed(request(app).get('/me'))).body.wallet.points).toBe(1000);
+    expect(sent.length).toBe(n);
   });
 
   it('refunds when the provider fails', async () => {
-    const failing = createApp({ db: openDb(':memory:'), config: { ...baseConfig, autoApproveWithdrawals: true }, keyProvider, messenger, payout: async () => { throw new Error('boom'); } });
+    const failing = createApp({ db: openDb(':memory:'), config: baseConfig, keyProvider, messenger, payout: async () => { throw new Error('boom'); } });
     const r = { body: await signup(failing, 'c@d.com') };
     await passKyc(failing, r.body.token);
     await verifyPhone(failing, r.body.token);
     for (const t of ['x', 'y']) await request(failing).get(`/admob/ssv?${ssvQuery(r.body.user.id, t)}`);
-    const w = await request(failing).post('/withdrawals').set('Authorization', `Bearer ${r.body.token}`).send({ method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } });
+    const w = await withdraw(failing, r.body.token, { method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } });
     expect(w.body.withdrawal.status).toBe('failed');
     expect(w.body.wallet.points).toBe(1000);
   });

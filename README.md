@@ -25,7 +25,8 @@ server/  Express API: auth, points ledger, AdMob SSV rewards, withdrawals, payou
 1. Every video starts with a **rewarded ad** (Google AdMob on iPhone).
 2. When the ad finishes, Google calls `GET /api/admob/ssv` on your server. The signature is verified against Google's public keys, then points are credited. Duplicate callbacks are ignored and there is a daily cap.
 3. Points convert to USD (`POINTS_PER_USD`). Once the user reaches `MIN_WITHDRAW_USD`, they can request a payout.
-4. The points are deducted right away. An admin approves the payout, or you set auto-approve. The payout then goes out via **Flutterwave** (M-Pesa, Airtel, MTN, Tigo… and bank accounts in Africa and other regions) or **PayPal Payouts** (global). Failed or rejected payouts are refunded.
+4. The user picks WhatsApp or SMS and receives a **one-time code on their verified phone number**. The code only confirms that exact payout (amount, method and account), can be used once, and expires after 10 minutes.
+5. After the code is entered, the points are deducted and the payout is sent **automatically, with no admin approval**, via **Flutterwave** (M-Pesa, Airtel, MTN, Tigo… and bank accounts in Africa and other regions) or **PayPal Payouts** (global). Failed payouts are refunded automatically.
 
 > Payouts are funded only by your ad revenue. Rewarded ads earn roughly $1–$15 per 1,000 views depending on country. Set `POINTS_PER_AD` / `POINTS_PER_USD` so you pay users less than you earn.
 
@@ -73,12 +74,9 @@ Apple may reject apps that pay cash for watching ads (Guideline 3.2.2). Present 
 ## Admin
 
 ```bash
-curl -H "x-admin-token: $ADMIN_TOKEN" https://api.your-domain.com/api/admin/withdrawals
 # KYC review
 curl -H "x-admin-token: $ADMIN_TOKEN" https://api.your-domain.com/api/admin/kyc
 curl -H "x-admin-token: $ADMIN_TOKEN" https://api.your-domain.com/api/admin/kyc/1/selfie -o selfie.jpg   # front | back | selfie
 curl -X POST -H "x-admin-token: $ADMIN_TOKEN" https://api.your-domain.com/api/admin/kyc/1/approve
 curl -X POST -H "x-admin-token: $ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"reason":"Blurry photo"}' https://api.your-domain.com/api/admin/kyc/1/reject
-curl -X POST -H "x-admin-token: $ADMIN_TOKEN" https://api.your-domain.com/api/admin/withdrawals/1/approve
-curl -X POST -H "x-admin-token: $ADMIN_TOKEN" https://api.your-domain.com/api/admin/withdrawals/1/reject
 ```

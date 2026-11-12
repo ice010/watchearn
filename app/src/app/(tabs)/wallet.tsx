@@ -3,7 +3,7 @@ import { useCallback, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { PhoneVerify } from '@/components/phone-verify';
-import { api, type LedgerEntry, type Wallet, type Withdrawal } from '@/lib/api';
+import { api, type CodeSent, type LedgerEntry, type Wallet, type Withdrawal } from '@/lib/api';
 import { useSession } from '@/lib/session';
 import { C } from '@/lib/theme';
 
@@ -22,6 +22,9 @@ export default function WalletScreen() {
   const [form, setForm] = useState({ amount: '', email: '', accountName: '', accountNumber: '', bankCode: '', currency: 'USD' });
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [channel, setChannel] = useState<'whatsapp' | 'sms'>('whatsapp');
+  const [otp, setOtp] = useState<{ body: object; sent: CodeSent } | null>(null);
+  const [code, setCode] = useState('');
 
   const load = useCallback(async () => {
     const r = await api<{ wallet: Wallet; history: LedgerEntry[]; withdrawals: Withdrawal[] }>('/wallet');
@@ -36,25 +39,39 @@ export default function WalletScreen() {
   const progress = Math.min(1, usd / min);
   const set = (k: keyof typeof form) => (v: string) => setForm((f) => ({ ...f, [k]: v }));
 
-  const cashOut = async () => {
+  const run = async (fn: () => Promise<void>) => {
     setMsg(null);
     setBusy(true);
     try {
-      const amountUsd = Number(form.amount);
-      const accountNumber = method === 'mobile_money' ? (user?.phone ?? '').replace(/\D/g, '') : form.accountNumber.trim();
-      const details = method === 'paypal'
-        ? { email: form.email.trim() }
-        : { accountName: form.accountName.trim(), accountNumber, bankCode: form.bankCode.trim().toUpperCase(), currency: form.currency.trim().toUpperCase() };
-      const r = await api<{ withdrawal: Withdrawal; wallet: Wallet }>('/withdrawals', { body: { method, amountUsd, details } });
-      setWallet(r.wallet);
-      setMsg({ ok: true, text: `Withdrawal of $${r.withdrawal.amount_usd.toFixed(2)} ${r.withdrawal.status.replace('_', ' ')}` });
-      await load();
+      await fn();
     } catch (e) {
       setMsg({ ok: false, text: (e as Error).message });
     } finally {
       setBusy(false);
     }
   };
+
+  // Step 1: send a one-time code to the verified phone for this exact payout.
+  const requestCode = (body?: object) => run(async () => {
+    const amountUsd = Number(form.amount);
+    const accountNumber = method === 'mobile_money' ? (user?.phone ?? '').replace(/\D/g, '') : form.accountNumber.trim();
+    const details = method === 'paypal'
+      ? { email: form.email.trim() }
+      : { accountName: form.accountName.trim(), accountNumber, bankCode: form.bankCode.trim().toUpperCase(), currency: form.currency.trim().toUpperCase() };
+    const b = body ?? { method, amountUsd, details };
+    const sent = await api<CodeSent>('/withdrawals', { body: { ...b, channel } });
+    setOtp({ body: b, sent });
+    setCode('');
+  });
+
+  // Step 2: confirm with the code; the payout is sent immediately.
+  const confirm = () => run(async () => {
+    const r = await api<{ withdrawal: Withdrawal; wallet: Wallet }>('/withdrawals', { body: { ...otp!.body, code: code.trim() } });
+    setOtp(null);
+    setWallet(r.wallet);
+    setMsg({ ok: r.withdrawal.status !== 'failed', text: `Withdrawal of $${r.withdrawal.amount_usd.toFixed(2)}: ${r.withdrawal.status.replace('_', ' ')}${r.withdrawal.error ? ` (${r.withdrawal.error}, points refunded)` : ''}` });
+    await load();
+  });
 
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
@@ -108,9 +125,45 @@ export default function WalletScreen() {
             <Field label="Payout currency" value={form.currency} onChangeText={set('currency')} placeholder="TZS, KES, NGN, GHS, UGX, USD…" />
           </>
         )}
-        <Pressable style={[styles.cta, (busy || usd < min) && { opacity: 0.5 }]} disabled={busy || usd < min} onPress={cashOut}>
-          {busy ? <ActivityIndicator color="#000" /> : <Text style={styles.ctaText}>Request payout</Text>}
-        </Pressable>
+        {!otp ? (
+          <>
+            <Text style={[styles.label, { marginTop: 16 }]}>Send confirmation code by</Text>
+            <View style={styles.methods}>
+              {(['whatsapp', 'sms'] as const).map((c) => (
+                <Pressable key={c} onPress={() => setChannel(c)} style={[styles.method, channel === c && styles.methodOn]}>
+                  <Text style={[styles.methodText, channel === c && { color: '#000' }]}>{c === 'whatsapp' ? 'WhatsApp' : 'SMS'}</Text>
+                </Pressable>
+              ))}
+            </View>
+            <Pressable style={[styles.cta, (busy || usd < min) && { opacity: 0.5 }]} disabled={busy || usd < min} onPress={() => requestCode()}>
+              {busy ? <ActivityIndicator color="#000" /> : <Text style={styles.ctaText}>Cash out</Text>}
+            </Pressable>
+          </>
+        ) : (
+          <View style={[styles.balanceCard, { marginTop: 16 }]}>
+            <Text style={{ color: C.text, fontWeight: '800', fontSize: 16 }}>Confirm your payout</Text>
+            <Text style={styles.muted}>Enter the 6-digit code sent by {otp.sent.channel === 'whatsapp' ? 'WhatsApp' : 'SMS'} to {otp.sent.sentTo}.</Text>
+            {otp.sent.devCode && <Text style={{ color: C.gold }}>Sandbox mode, no message sent. Your code: {otp.sent.devCode}</Text>}
+            <TextInput
+              style={[styles.input, { fontSize: 22, letterSpacing: 8, textAlign: 'center' }]}
+              value={code}
+              onChangeText={setCode}
+              placeholder="000000"
+              placeholderTextColor="#555"
+              keyboardType="number-pad"
+              maxLength={6}
+              textContentType="oneTimeCode"
+              autoComplete="one-time-code"
+            />
+            <Pressable style={[styles.cta, (busy || code.trim().length !== 6) && { opacity: 0.5 }]} disabled={busy || code.trim().length !== 6} onPress={confirm}>
+              {busy ? <ActivityIndicator color="#000" /> : <Text style={styles.ctaText}>Confirm and send money</Text>}
+            </Pressable>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 }}>
+              <Pressable onPress={() => requestCode(otp.body)} disabled={busy}><Text style={{ color: C.accent, fontWeight: '700' }}>Resend code</Text></Pressable>
+              <Pressable onPress={() => setOtp(null)} disabled={busy}><Text style={styles.muted}>Cancel</Text></Pressable>
+            </View>
+          </View>
+        )}
         {msg && <Text style={{ color: msg.ok ? C.accent : C.danger, marginTop: 8 }}>{msg.text}</Text>}
         </>)}
 

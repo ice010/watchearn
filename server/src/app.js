@@ -54,7 +54,6 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
     withdrawalById: db.prepare('SELECT * FROM withdrawals WHERE id = ?'),
     withdrawalByRef: db.prepare('SELECT * FROM withdrawals WHERE provider_ref = ?'),
     userWithdrawals: db.prepare('SELECT id, points, amount_usd, method, status, error, created_at FROM withdrawals WHERE user_id = ? ORDER BY id DESC'),
-    pendingWithdrawals: db.prepare(`SELECT w.*, u.email FROM withdrawals w JOIN users u ON u.id = w.user_id WHERE status = 'pending_review' ORDER BY w.id`),
     setWithdrawal: db.prepare(`UPDATE withdrawals SET status = ?, provider_ref = COALESCE(?, provider_ref), error = ?, updated_at = datetime('now') WHERE id = ?`),
   };
 
@@ -87,7 +86,8 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
     crypto.createHmac('sha256', config.jwtSecret).update(`${userId}:${purpose}:${code}`).digest('hex');
 
   // Creates and delivers a 6-digit code. Throws { status, message } on cooldown/provider errors.
-  async function issueCode(userId, purpose, channel, target) {
+  // `bind` ties a code to specific data (e.g. the exact withdrawal being confirmed).
+  async function issueCode(userId, purpose, channel, target, bind = '') {
     const last = q.latestCode.get(userId, purpose);
     if (last && last.recent && !last.used_at) {
       const err = new Error(`Please wait ${RESEND_COOLDOWN_SEC} seconds before requesting another code`);
@@ -95,7 +95,7 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
       throw err;
     }
     const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
-    q.insertCode.run(userId, purpose, target, channel, hashCode(userId, purpose, code));
+    q.insertCode.run(userId, purpose, target, channel, hashCode(userId, purpose + bind, code));
     try {
       const r = await messenger(config, channel, target, code);
       return r.sandbox ? { sentTo: target, channel, devCode: code } : { sentTo: target, channel };
@@ -106,13 +106,13 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
     }
   }
 
-  function checkCode(userId, purpose, code) {
+  function checkCode(userId, purpose, code, bind = '') {
     const c = q.latestCode.get(userId, purpose);
     if (!c || c.used_at) return { ok: false, error: 'Request a new code' };
     if (!c.fresh) return { ok: false, error: 'Code expired. Request a new one' };
     if (c.attempts >= CODE_MAX_ATTEMPTS) return { ok: false, error: 'Too many attempts. Request a new code' };
     q.bumpAttempts.run(c.id);
-    const a = Buffer.from(hashCode(userId, purpose, String(code || '')));
+    const a = Buffer.from(hashCode(userId, purpose + bind, String(code || '')));
     if (!crypto.timingSafeEqual(a, Buffer.from(c.code_hash))) return { ok: false, error: 'Wrong code' };
     q.useCode.run(c.id);
     return { ok: true, target: c.target };
@@ -350,6 +350,10 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
     }),
   ]);
 
+  const maskPhone = (p) => `${p.slice(0, 4)}•••••${p.slice(-3)}`;
+
+  // Step 1 (no `code`): validates and sends a one-time code to the verified phone.
+  // Step 2 (same body + `code`): confirms and pays out automatically, no admin review.
   app.post('/withdrawals', auth, async (req, res) => {
     const p = withdrawalSchema.safeParse(req.body);
     if (!p.success) return res.status(400).json({ error: 'Invalid withdrawal details', issues: p.error.issues });
@@ -365,17 +369,30 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
     }
     if (amountUsd < config.minWithdrawUsd) return res.status(400).json({ error: `Minimum withdrawal is $${config.minWithdrawUsd}` });
     const points = Math.round(amountUsd * config.pointsPerUsd);
+    if (q.balance.get(req.userId).points < points) return res.status(400).json({ error: 'Insufficient balance' });
+
+    const bind = `:${crypto.createHash('sha256').update(JSON.stringify(p.data)).digest('hex')}`;
+    if (!req.body.code) {
+      try {
+        const channel = req.body.channel === 'whatsapp' ? 'whatsapp' : 'sms';
+        const sent = await issueCode(req.userId, 'withdraw', channel, req.user.phone, bind);
+        return res.status(202).json({ otpRequired: true, ...sent, sentTo: maskPhone(sent.sentTo) });
+      } catch (e) {
+        return sendErr(res, e);
+      }
+    }
+    const c = checkCode(req.userId, 'withdraw', req.body.code, bind);
+    if (!c.ok) return res.status(400).json({ error: c.error, otpRequired: true });
 
     const create = db.transaction(() => {
       if (q.balance.get(req.userId).points < points) return null;
-      const status = config.autoApproveWithdrawals ? 'approved' : 'pending_review';
-      const r = q.insertWithdrawal.run(req.userId, points, amountUsd, method, JSON.stringify(details), status);
+      const r = q.insertWithdrawal.run(req.userId, points, amountUsd, method, JSON.stringify(details), 'approved');
       q.insertLedger.run(req.userId, -points, 'withdrawal', `w${r.lastInsertRowid}`, `Cash out via ${method}`);
       return q.withdrawalById.get(r.lastInsertRowid);
     });
     let w = create();
     if (!w) return res.status(400).json({ error: 'Insufficient balance' });
-    if (w.status === 'approved') w = await processWithdrawal(w);
+    w = await processWithdrawal(w);
     res.status(201).json({ withdrawal: { id: w.id, status: w.status, amount_usd: w.amount_usd, method: w.method, error: w.error }, wallet: summary(req.userId) });
   });
 
@@ -400,21 +417,6 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
     res.json({ submission: q.kycById.get(k.id) });
   });
 
-  app.get('/admin/withdrawals', admin, (_req, res) => res.json({ withdrawals: q.pendingWithdrawals.all() }));
-
-  app.post('/admin/withdrawals/:id/approve', admin, async (req, res) => {
-    const w = q.withdrawalById.get(Number(req.params.id));
-    if (!w || w.status !== 'pending_review') return res.status(404).json({ error: 'Not pending' });
-    q.setWithdrawal.run('approved', null, null, w.id);
-    res.json({ withdrawal: await processWithdrawal(w) });
-  });
-
-  app.post('/admin/withdrawals/:id/reject', admin, (req, res) => {
-    const w = q.withdrawalById.get(Number(req.params.id));
-    if (!w || w.status !== 'pending_review') return res.status(404).json({ error: 'Not pending' });
-    failWithdrawal(w, String(req.body.reason || 'Rejected'));
-    res.json({ withdrawal: q.withdrawalById.get(w.id) });
-  });
 
   // Flutterwave transfer status webhook.
   app.post('/webhooks/flutterwave', (req, res) => {

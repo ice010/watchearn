@@ -23,7 +23,6 @@ const config = {
 
   // sandbox = simulate payouts; live = call providers.
   payoutMode: process.env.PAYOUT_MODE || 'sandbox',
-  autoApproveWithdrawals: bool(process.env.AUTO_APPROVE_WITHDRAWALS, false),
 
   // sandbox = verification codes are logged and returned to the client; live = sent by email/SMS/WhatsApp.
   messagingMode: process.env.MESSAGING_MODE || 'sandbox',
