@@ -29,14 +29,15 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
     userById: db.prepare('SELECT id, email, name, country, email_verified, phone, phone_verified_at, kyc_status, kyc_challenge, created_at FROM users WHERE id = ?'),
     setKyc: db.prepare('UPDATE users SET kyc_status = ?, kyc_challenge = COALESCE(?, kyc_challenge) WHERE id = ?'),
     setChallenge: db.prepare('UPDATE users SET kyc_challenge = ? WHERE id = ?'),
-    insertKyc: db.prepare(`INSERT INTO kyc_submissions (user_id, full_name, date_of_birth, country, id_type, id_number, front_file, back_file, selfie_file, challenge)
-      VALUES (@userId, @fullName, @dateOfBirth, @country, @idType, @idNumber, @front, @back, @selfie, @challenge)`),
+    insertKyc: db.prepare(`INSERT INTO kyc_submissions (user_id, full_name, date_of_birth, country, id_type, id_number, front_file, back_file, selfie_file,
+        front_hash, back_hash, selfie_hash, name_key, flags, challenge)
+      VALUES (@userId, @fullName, @dateOfBirth, @country, @idType, @idNumber, @front, @back, @selfie,
+        @frontHash, @backHash, @selfieHash, @nameKey, @flags, @challenge)`),
     latestKyc: db.prepare('SELECT id, status, reviewer_note, created_at FROM kyc_submissions WHERE user_id = ? ORDER BY id DESC LIMIT 1'),
     kycById: db.prepare('SELECT * FROM kyc_submissions WHERE id = ?'),
-    pendingKyc: db.prepare(`SELECT k.id, k.user_id, u.email, k.full_name, k.date_of_birth, k.country, k.id_type, k.id_number, k.challenge, k.created_at
-      FROM kyc_submissions k JOIN users u ON u.id = k.user_id WHERE k.status = 'pending' ORDER BY k.id`),
+    pendingKyc: db.prepare(`SELECT k.id, k.user_id, u.email, k.full_name, k.date_of_birth, k.country, k.id_type, k.id_number, k.challenge, k.flags, k.created_at
+      FROM kyc_submissions k JOIN users u ON u.id = k.user_id WHERE k.status = 'pending' ORDER BY k.flags = '[]', k.id`),
     reviewKyc: db.prepare(`UPDATE kyc_submissions SET status = ?, reviewer_note = ?, reviewed_at = datetime('now') WHERE id = ?`),
-    docOwner: db.prepare(`SELECT user_id FROM kyc_submissions WHERE country = ? AND id_type = ? AND id_number = ? AND status IN ('pending', 'approved') AND user_id != ? LIMIT 1`),
     setEmailVerified: db.prepare('UPDATE users SET email_verified = 1 WHERE id = ?'),
     setPhone: db.prepare(`UPDATE users SET phone = ?, phone_verified_at = datetime('now') WHERE id = ?`),
     phoneOwner: db.prepare('SELECT id FROM users WHERE phone = ? AND phone_verified_at IS NOT NULL AND id != ?'),
@@ -254,13 +255,24 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
     if (!front || !selfie || (d.idType !== 'passport' && !back)) {
       return res.status(400).json({ error: 'Clear photos of your ID (front and back) and a selfie are required (JPEG/PNG, max 8 MB)' });
     }
-    if (q.docOwner.get(d.country, d.idType, d.idNumber, req.userId)) return res.status(409).json({ error: 'This ID is already used on another account' });
+    const sub = {
+      userId: req.userId, fullName: d.fullName, dateOfBirth: d.dateOfBirth, country: d.country, idType: d.idType, idNumber: d.idNumber,
+      frontHash: kyc.imageHash(front), backHash: back ? kyc.imageHash(back) : null, selfieHash: kyc.imageHash(selfie), nameKey: kyc.nameKey(d.fullName),
+    };
+    if (sub.selfieHash === sub.frontHash || sub.selfieHash === sub.backHash || (back && sub.frontHash === sub.backHash)) {
+      return res.status(400).json({ error: 'Each photo must be different: ID front, ID back and a new selfie' });
+    }
+    const dup = kyc.findDuplicates(db, req.userId, sub);
+    if (dup.blocking.length) {
+      const what = dup.blocking.includes('id_number') ? 'This ID document is' : 'One of these photos is';
+      return res.status(409).json({ error: `${what} already registered to another account. If it belongs to you, contact support.`, duplicate: dup.blocking });
+    }
     const challenge = req.user.kyc_challenge || kyc.randomChallenge();
     db.transaction(() => {
       q.insertKyc.run({
-        userId: req.userId, fullName: d.fullName, dateOfBirth: d.dateOfBirth, country: d.country, idType: d.idType, idNumber: d.idNumber,
+        ...sub, flags: JSON.stringify(dup.flags), challenge,
         front: kyc.saveImage(config.kycDir, front), back: back ? kyc.saveImage(config.kycDir, back) : null,
-        selfie: kyc.saveImage(config.kycDir, selfie), challenge,
+        selfie: kyc.saveImage(config.kycDir, selfie),
       });
       q.setKyc.run('pending', null, req.userId);
     })();
@@ -367,7 +379,7 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
     res.status(201).json({ withdrawal: { id: w.id, status: w.status, amount_usd: w.amount_usd, method: w.method, error: w.error }, wallet: summary(req.userId) });
   });
 
-  app.get('/admin/kyc', admin, (_req, res) => res.json({ submissions: q.pendingKyc.all() }));
+  app.get('/admin/kyc', admin, (_req, res) => res.json({ submissions: q.pendingKyc.all().map((k) => ({ ...k, flags: JSON.parse(k.flags) })) }));
 
   app.get('/admin/kyc/:id/:image', admin, (req, res) => {
     const k = q.kycById.get(Number(req.params.id));

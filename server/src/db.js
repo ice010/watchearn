@@ -57,6 +57,11 @@ function openDb(file) {
       front_file TEXT NOT NULL,
       back_file TEXT,
       selfie_file TEXT NOT NULL,
+      front_hash TEXT,
+      back_hash TEXT,
+      selfie_hash TEXT,
+      name_key TEXT,
+      flags TEXT NOT NULL DEFAULT '[]', -- possible duplicate accounts found at submission (JSON)
       challenge TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending',
       reviewer_note TEXT,
@@ -64,6 +69,7 @@ function openDb(file) {
       reviewed_at TEXT
     );
     CREATE INDEX IF NOT EXISTS kyc_doc ON kyc_submissions(country, id_type, id_number);
+    CREATE INDEX IF NOT EXISTS kyc_idnum ON kyc_submissions(id_number);
     CREATE TABLE IF NOT EXISTS verification_codes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL REFERENCES users(id),
@@ -79,6 +85,13 @@ function openDb(file) {
     CREATE INDEX IF NOT EXISTS verification_user ON verification_codes(user_id, purpose, id);
   `);
   // Columns added after the first release.
+  const kcols = db.prepare('PRAGMA table_info(kyc_submissions)').all().map((c) => c.name);
+  for (const c of ['front_hash', 'back_hash', 'selfie_hash', 'name_key']) if (!kcols.includes(c)) db.exec(`ALTER TABLE kyc_submissions ADD COLUMN ${c} TEXT`);
+  if (!kcols.includes('flags')) db.exec(`ALTER TABLE kyc_submissions ADD COLUMN flags TEXT NOT NULL DEFAULT '[]'`);
+  db.exec(`CREATE INDEX IF NOT EXISTS kyc_person ON kyc_submissions(name_key, date_of_birth);
+    CREATE INDEX IF NOT EXISTS kyc_front ON kyc_submissions(front_hash);
+    CREATE INDEX IF NOT EXISTS kyc_back ON kyc_submissions(back_hash);
+    CREATE INDEX IF NOT EXISTS kyc_selfie ON kyc_submissions(selfie_hash);`);
   const cols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
   if (!cols.includes('email_verified')) db.exec('ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0');
   if (!cols.includes('phone')) db.exec('ALTER TABLE users ADD COLUMN phone TEXT');

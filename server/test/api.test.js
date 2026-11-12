@@ -31,10 +31,10 @@ async function signup(a, email) {
   const v = await request(a).post('/auth/verify-email').send({ email, code: r.body.devCode });
   return v.body;
 }
-const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(2048, 1)]).toString('base64');
+const jpeg = (n = 1) => Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(2048, n)]).toString('base64');
 const kycBody = (over = {}) => ({
   fullName: 'Jane Doe', dateOfBirth: '1995-04-01', country: 'tz', idType: 'national_id', idNumber: '1995 0401 123',
-  front: `data:image/jpeg;base64,${jpeg}`, back: jpeg, selfie: jpeg, ...over,
+  front: `data:image/jpeg;base64,${jpeg(1)}`, back: jpeg(2), selfie: jpeg(3), ...over,
 });
 async function passKyc(a, tok, over) {
   const s = await request(a).post('/kyc').set('Authorization', `Bearer ${tok}`).send(kycBody(over));
@@ -102,7 +102,9 @@ describe('identity verification (KYC)', () => {
 
     const other = await signup(app, 'dup@x.com');
     const dup = await request(app).post('/kyc').set('Authorization', `Bearer ${other.token}`).send(kycBody());
-    expect(dup.body.error).toMatch(/another account/);
+    expect(dup.status).toBe(409);
+    expect(dup.body.error).toMatch(/already registered to another account/);
+    expect(dup.body.duplicate).toEqual(['id_number', 'photo']);
 
     const list = (await request(app).get('/admin/kyc').set('x-admin-token', 'admintoken')).body.submissions;
     expect(list).toHaveLength(1);
@@ -119,6 +121,31 @@ describe('identity verification (KYC)', () => {
     await request(app).post(`/admin/kyc/${list[0].id}/approve`).set('x-admin-token', 'admintoken');
     expect((await authed(request(app).get('/me'))).body.user.kyc_status).toBe('approved');
     expect((await authed(request(app).post('/withdrawals')).send({ method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } })).status).toBe(201);
+  });
+
+  it('checks submitted details against other accounts', async () => {
+    expect((await authed(request(app).post('/kyc')).send(kycBody({ selfie: jpeg(1) }))).body.error).toMatch(/different/);
+    expect((await authed(request(app).post('/kyc')).send(kycBody())).status).toBe(201);
+    const send = async (email, over) => request(app).post('/kyc').set('Authorization', `Bearer ${(await signup(app, email)).token}`).send(kycBody(over));
+
+    // Same photo reused with a different ID number: blocked.
+    const photo = await send('b@x.com', { idNumber: 'OTHER123', front: jpeg(7), back: jpeg(8) });
+    expect(photo.status).toBe(409);
+    expect(photo.body.duplicate).toEqual(['photo']);
+
+    // Same name (any order/case) + birth date, new document and photos: allowed but flagged for the reviewer.
+    const person = await send('c@x.com', { fullName: 'DOE  jane', idNumber: 'NEW99999', front: jpeg(11), back: jpeg(12), selfie: jpeg(13) });
+    expect(person.status).toBe(201);
+    // Same number on a different document type: flagged.
+    const num = await send('d@x.com', { fullName: 'Someone Else', idType: 'passport', idNumber: '19950401123', front: jpeg(21), back: undefined, selfie: jpeg(23) });
+    expect(num.status).toBe(201);
+
+    const list = (await request(app).get('/admin/kyc').set('x-admin-token', 'admintoken')).body.submissions;
+    const byEmail = Object.fromEntries(list.map((k) => [k.email, k]));
+    expect(byEmail['c@x.com'].flags).toMatchObject([{ type: 'same_person', email: 'a@b.com' }]);
+    expect(byEmail['d@x.com'].flags.map((f) => f.type)).toEqual(['same_id_number']);
+    expect(byEmail['a@b.com'].flags).toEqual([]);
+    expect(list.at(-1).email).toBe('a@b.com'); // flagged submissions are listed first
   });
 
   it('lets a rejected user resubmit with a new challenge', async () => {
