@@ -1,4 +1,6 @@
 const crypto = require('crypto');
+const os = require('os');
+const path = require('path');
 const request = require('supertest');
 
 const { openDb } = require('../src/db');
@@ -18,6 +20,7 @@ const baseConfig = {
   pointsPerAd: 500, pointsPerUsd: 1000, minWithdrawUsd: 1, maxAdsPerDay: 3,
   sandboxRewards: true, payoutMode: 'sandbox', autoApproveWithdrawals: false,
   flutterwave: {}, paypal: {},
+  kycDir: path.join(os.tmpdir(), `watchearn-kyc-${process.pid}`),
 };
 
 const sent = [];
@@ -27,6 +30,17 @@ async function signup(a, email) {
   const r = await request(a).post('/auth/register').send({ email, password: 'password123' });
   const v = await request(a).post('/auth/verify-email').send({ email, code: r.body.devCode });
   return v.body;
+}
+const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(2048, 1)]).toString('base64');
+const kycBody = (over = {}) => ({
+  fullName: 'Jane Doe', dateOfBirth: '1995-04-01', country: 'tz', idType: 'national_id', idNumber: '1995 0401 123',
+  front: `data:image/jpeg;base64,${jpeg}`, back: jpeg, selfie: jpeg, ...over,
+});
+async function passKyc(a, tok, over) {
+  const s = await request(a).post('/kyc').set('Authorization', `Bearer ${tok}`).send(kycBody(over));
+  const id = (await request(a).get('/admin/kyc').set('x-admin-token', 'admintoken')).body.submissions.at(-1).id;
+  await request(a).post(`/admin/kyc/${id}/approve`).set('x-admin-token', 'admintoken');
+  return s;
 }
 async function verifyPhone(a, tok, phone = '+255712345678') {
   const s = await request(a).post('/phone/start').set('Authorization', `Bearer ${tok}`).send({ phone, channel: 'whatsapp' });
@@ -68,6 +82,55 @@ describe('email verification', () => {
     const v = await request(app).post('/auth/verify-email').send({ email: 'lock@x.com', code: r.body.devCode });
     expect(v.body.error).toMatch(/Too many attempts/);
     expect((await request(app).post('/auth/resend-code').send({ email: 'lock@x.com' })).status).toBe(429);
+  });
+});
+
+describe('identity verification (KYC)', () => {
+  it('validates, stores for review, blocks duplicate IDs and gates withdrawals', async () => {
+    const k = await authed(request(app).get('/kyc'));
+    expect(k.body.status).toBe('none');
+    expect(k.body.challenge).toBeTruthy();
+
+    expect((await authed(request(app).post('/kyc')).send(kycBody({ selfie: 'bm90IGFuIGltYWdl' }))).status).toBe(400);
+    expect((await authed(request(app).post('/kyc')).send(kycBody({ dateOfBirth: '2015-01-01' }))).body.error).toMatch(/18/);
+    expect((await authed(request(app).post('/kyc')).send(kycBody({ back: undefined }))).status).toBe(400);
+
+    const s = await authed(request(app).post('/kyc')).send(kycBody());
+    expect(s.status).toBe(201);
+    expect(s.body.user.kyc_status).toBe('pending');
+    expect((await authed(request(app).post('/kyc')).send(kycBody())).status).toBe(409);
+
+    const other = await signup(app, 'dup@x.com');
+    const dup = await request(app).post('/kyc').set('Authorization', `Bearer ${other.token}`).send(kycBody());
+    expect(dup.body.error).toMatch(/another account/);
+
+    const list = (await request(app).get('/admin/kyc').set('x-admin-token', 'admintoken')).body.submissions;
+    expect(list).toHaveLength(1);
+    expect(list[0].id_number).toBe('19950401123');
+    expect((await request(app).get(`/admin/kyc/${list[0].id}/selfie`).set('x-admin-token', 'admintoken')).status).toBe(200);
+    expect((await request(app).get(`/admin/kyc/${list[0].id}/selfie`)).status).toBe(401);
+
+    await verifyPhone(app, token);
+    await request(app).get(`/admob/ssv?${ssvQuery(userId, 'k1')}`);
+    await request(app).get(`/admob/ssv?${ssvQuery(userId, 'k2')}`);
+    const w = await authed(request(app).post('/withdrawals')).send({ method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } });
+    expect(w.body.kycRequired).toBe(true);
+
+    await request(app).post(`/admin/kyc/${list[0].id}/approve`).set('x-admin-token', 'admintoken');
+    expect((await authed(request(app).get('/me'))).body.user.kyc_status).toBe('approved');
+    expect((await authed(request(app).post('/withdrawals')).send({ method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } })).status).toBe(201);
+  });
+
+  it('lets a rejected user resubmit with a new challenge', async () => {
+    const before = (await authed(request(app).get('/kyc'))).body.challenge;
+    await authed(request(app).post('/kyc')).send(kycBody({ idType: 'passport', back: undefined }));
+    const id = (await request(app).get('/admin/kyc').set('x-admin-token', 'admintoken')).body.submissions[0].id;
+    await request(app).post(`/admin/kyc/${id}/reject`).set('x-admin-token', 'admintoken').send({ reason: 'Blurry photo' });
+    const k = (await authed(request(app).get('/kyc'))).body;
+    expect(k.status).toBe('rejected');
+    expect(k.submission.reviewer_note).toBe('Blurry photo');
+    expect(typeof before).toBe('string');
+    expect((await authed(request(app).post('/kyc')).send(kycBody())).status).toBe(201);
   });
 });
 
@@ -114,6 +177,7 @@ describe('withdrawals', () => {
 
   it('requires a verified phone, and mobile money must go to that phone', async () => {
     await earn(2);
+    await passKyc(app, token);
     const details = { accountName: 'Jane Doe', accountNumber: '255700000000', bankCode: 'MPS', currency: 'TZS' };
     const r = await authed(request(app).post('/withdrawals')).send({ method: 'mobile_money', amountUsd: 1, details });
     expect(r.status).toBe(403);
@@ -126,6 +190,7 @@ describe('withdrawals', () => {
 
   it('holds points, then pays on admin approval', async () => {
     await earn(2);
+    await passKyc(app, token);
     await verifyPhone(app, token); // 1000 pts = $1
     const w = await authed(request(app).post('/withdrawals')).send({ method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } });
     expect(w.status).toBe(201);
@@ -137,6 +202,7 @@ describe('withdrawals', () => {
 
   it('rejects insufficient balance and refunds rejected withdrawals', async () => {
     await earn(2);
+    await passKyc(app, token);
     await verifyPhone(app, token);
     const details = { accountName: 'Jane Doe', accountNumber: '255712345678', bankCode: 'MPS', currency: 'TZS' };
     expect((await authed(request(app).post('/withdrawals')).send({ method: 'mobile_money', amountUsd: 2, details })).body.error).toBe('Insufficient balance');
@@ -148,6 +214,7 @@ describe('withdrawals', () => {
   it('refunds when the provider fails', async () => {
     const failing = createApp({ db: openDb(':memory:'), config: { ...baseConfig, autoApproveWithdrawals: true }, keyProvider, messenger, payout: async () => { throw new Error('boom'); } });
     const r = { body: await signup(failing, 'c@d.com') };
+    await passKyc(failing, r.body.token);
     await verifyPhone(failing, r.body.token);
     for (const t of ['x', 'y']) await request(failing).get(`/admob/ssv?${ssvQuery(r.body.user.id, t)}`);
     const w = await request(failing).post('/withdrawals').set('Authorization', `Bearer ${r.body.token}`).send({ method: 'paypal', amountUsd: 1, details: { email: 'x@y.com' } });

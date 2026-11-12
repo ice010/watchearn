@@ -12,6 +12,7 @@ export default function Account() {
         <View style={styles.card}>
           <Text style={styles.name}>{user?.name || 'Viewer'}</Text>
           <Text style={styles.muted}>{user?.email} · {user?.email_verified ? 'verified' : 'not verified'}</Text>
+          <Text style={styles.muted}>Identity: {user?.kyc_status === 'approved' ? 'verified' : user?.kyc_status === 'pending' ? 'in review' : 'not verified'}</Text>
           <Text style={styles.muted}>Phone: {user?.phone_verified ? `${user.phone} · verified` : 'not verified (needed to cash out)'}</Text>
         </View>
         <View style={styles.card}>

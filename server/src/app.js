@@ -9,6 +9,8 @@ const { catalog } = require('./catalog');
 const { verifySsv } = require('./admobSsv');
 const { sendPayout } = require('./payouts');
 const { sendCode } = require('./messaging');
+const path = require('path');
+const kyc = require('./kyc');
 
 const CODE_TTL_MIN = 10;
 const CODE_MAX_ATTEMPTS = 5;
@@ -19,11 +21,22 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
   const app = express();
   app.set('trust proxy', 1);
   app.use(cors());
-  app.use(express.json());
+  app.use(express.json({ limit: '30mb' }));
+  app.use((req, _res, next) => { req.body ??= {}; next(); });
 
   const q = {
     userByEmail: db.prepare('SELECT * FROM users WHERE email = ?'),
-    userById: db.prepare('SELECT id, email, name, country, email_verified, phone, phone_verified_at, created_at FROM users WHERE id = ?'),
+    userById: db.prepare('SELECT id, email, name, country, email_verified, phone, phone_verified_at, kyc_status, kyc_challenge, created_at FROM users WHERE id = ?'),
+    setKyc: db.prepare('UPDATE users SET kyc_status = ?, kyc_challenge = COALESCE(?, kyc_challenge) WHERE id = ?'),
+    setChallenge: db.prepare('UPDATE users SET kyc_challenge = ? WHERE id = ?'),
+    insertKyc: db.prepare(`INSERT INTO kyc_submissions (user_id, full_name, date_of_birth, country, id_type, id_number, front_file, back_file, selfie_file, challenge)
+      VALUES (@userId, @fullName, @dateOfBirth, @country, @idType, @idNumber, @front, @back, @selfie, @challenge)`),
+    latestKyc: db.prepare('SELECT id, status, reviewer_note, created_at FROM kyc_submissions WHERE user_id = ? ORDER BY id DESC LIMIT 1'),
+    kycById: db.prepare('SELECT * FROM kyc_submissions WHERE id = ?'),
+    pendingKyc: db.prepare(`SELECT k.id, k.user_id, u.email, k.full_name, k.date_of_birth, k.country, k.id_type, k.id_number, k.challenge, k.created_at
+      FROM kyc_submissions k JOIN users u ON u.id = k.user_id WHERE k.status = 'pending' ORDER BY k.id`),
+    reviewKyc: db.prepare(`UPDATE kyc_submissions SET status = ?, reviewer_note = ?, reviewed_at = datetime('now') WHERE id = ?`),
+    docOwner: db.prepare(`SELECT user_id FROM kyc_submissions WHERE country = ? AND id_type = ? AND id_number = ? AND status IN ('pending', 'approved') AND user_id != ? LIMIT 1`),
     setEmailVerified: db.prepare('UPDATE users SET email_verified = 1 WHERE id = ?'),
     setPhone: db.prepare(`UPDATE users SET phone = ?, phone_verified_at = datetime('now') WHERE id = ?`),
     phoneOwner: db.prepare('SELECT id FROM users WHERE phone = ? AND phone_verified_at IS NOT NULL AND id != ?'),
@@ -47,6 +60,7 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
   const publicUser = (u) => u && ({
     id: u.id, email: u.email, name: u.name, country: u.country,
     email_verified: !!u.email_verified, phone: u.phone, phone_verified: !!u.phone_verified_at,
+    kyc_status: u.kyc_status,
   });
   const sign = (user) => jwt.sign({ sub: user.id }, config.jwtSecret, { expiresIn: '30d' });
   const usd = (points) => Math.floor((points / config.pointsPerUsd) * 100) / 100;
@@ -207,6 +221,52 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
 
   app.get('/me', auth, (req, res) => res.json({ user: publicUser(req.user), wallet: summary(req.userId) }));
 
+  // Identity verification (KYC): ID document photos + selfie with a random challenge, reviewed by an admin.
+  app.get('/kyc', auth, (req, res) => {
+    let challenge = req.user.kyc_challenge;
+    if (!challenge) {
+      challenge = kyc.randomChallenge();
+      q.setChallenge.run(challenge, req.userId);
+    }
+    res.json({ status: req.user.kyc_status, challenge, idTypes: kyc.ID_TYPES, submission: q.latestKyc.get(req.userId) || null });
+  });
+
+  const kycSchema = z.object({
+    fullName: z.string().trim().min(3).max(100),
+    dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    country: z.string().length(2).transform((s) => s.toUpperCase()),
+    idType: z.enum(kyc.ID_TYPES),
+    idNumber: z.string().trim().min(4).max(30).transform((s) => s.toUpperCase().replace(/\s+/g, '')),
+    front: z.string(),
+    back: z.string().optional(),
+    selfie: z.string(),
+  });
+  const kycLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 10, keyGenerator: (req) => String(req.userId) });
+  app.post('/kyc', auth, kycLimiter, (req, res) => {
+    if (['pending', 'approved'].includes(req.user.kyc_status)) return res.status(409).json({ error: `Verification already ${req.user.kyc_status}` });
+    const p = kycSchema.safeParse(req.body);
+    if (!p.success) return res.status(400).json({ error: 'Fill in all identity details', issues: p.error.issues });
+    const d = p.data;
+    if (kyc.ageOn(d.dateOfBirth) < 18) return res.status(400).json({ error: 'You must be 18 or older' });
+    const front = kyc.decodeImage(d.front);
+    const back = d.back ? kyc.decodeImage(d.back) : null;
+    const selfie = kyc.decodeImage(d.selfie);
+    if (!front || !selfie || (d.idType !== 'passport' && !back)) {
+      return res.status(400).json({ error: 'Clear photos of your ID (front and back) and a selfie are required (JPEG/PNG, max 8 MB)' });
+    }
+    if (q.docOwner.get(d.country, d.idType, d.idNumber, req.userId)) return res.status(409).json({ error: 'This ID is already used on another account' });
+    const challenge = req.user.kyc_challenge || kyc.randomChallenge();
+    db.transaction(() => {
+      q.insertKyc.run({
+        userId: req.userId, fullName: d.fullName, dateOfBirth: d.dateOfBirth, country: d.country, idType: d.idType, idNumber: d.idNumber,
+        front: kyc.saveImage(config.kycDir, front), back: back ? kyc.saveImage(config.kycDir, back) : null,
+        selfie: kyc.saveImage(config.kycDir, selfie), challenge,
+      });
+      q.setKyc.run('pending', null, req.userId);
+    })();
+    res.status(201).json({ user: publicUser(q.userById.get(req.userId)), submission: q.latestKyc.get(req.userId) });
+  });
+
   // Phone verification (required before withdrawing). Code goes out by SMS or WhatsApp.
   const phoneLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, keyGenerator: (req) => String(req.userId) });
   app.post('/phone/start', auth, phoneLimiter, async (req, res) => {
@@ -282,6 +342,9 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
     const p = withdrawalSchema.safeParse(req.body);
     if (!p.success) return res.status(400).json({ error: 'Invalid withdrawal details', issues: p.error.issues });
     const { method, amountUsd, details } = p.data;
+    if (req.user.kyc_status !== 'approved') {
+      return res.status(403).json({ error: 'Your identity must be verified before withdrawing', kycRequired: true });
+    }
     if (!req.user.phone_verified_at) {
       return res.status(403).json({ error: 'Verify your phone number before withdrawing', phoneVerificationRequired: true });
     }
@@ -302,6 +365,27 @@ function createApp({ db, config, keyProvider, payout = sendPayout, messenger = s
     if (!w) return res.status(400).json({ error: 'Insufficient balance' });
     if (w.status === 'approved') w = await processWithdrawal(w);
     res.status(201).json({ withdrawal: { id: w.id, status: w.status, amount_usd: w.amount_usd, method: w.method, error: w.error }, wallet: summary(req.userId) });
+  });
+
+  app.get('/admin/kyc', admin, (_req, res) => res.json({ submissions: q.pendingKyc.all() }));
+
+  app.get('/admin/kyc/:id/:image', admin, (req, res) => {
+    const k = q.kycById.get(Number(req.params.id));
+    const file = k && { front: k.front_file, back: k.back_file, selfie: k.selfie_file }[req.params.image];
+    if (!file) return res.sendStatus(404);
+    res.sendFile(path.resolve(config.kycDir, file));
+  });
+
+  app.post('/admin/kyc/:id/:decision', admin, (req, res) => {
+    const k = q.kycById.get(Number(req.params.id));
+    const decision = { approve: 'approved', reject: 'rejected' }[req.params.decision];
+    if (!k || k.status !== 'pending' || !decision) return res.status(404).json({ error: 'Not pending' });
+    db.transaction(() => {
+      q.reviewKyc.run(decision, req.body.reason ? String(req.body.reason).slice(0, 300) : null, k.id);
+      // A rejected user gets a fresh selfie challenge for the next attempt.
+      q.setKyc.run(decision, decision === 'rejected' ? kyc.randomChallenge() : null, k.user_id);
+    })();
+    res.json({ submission: q.kycById.get(k.id) });
   });
 
   app.get('/admin/withdrawals', admin, (_req, res) => res.json({ withdrawals: q.pendingWithdrawals.all() }));

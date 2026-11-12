@@ -15,6 +15,7 @@ export default function TabsLayout() {
   const { ready, user } = useSession();
   if (!ready) return <View style={{ flex: 1, backgroundColor: C.bg, justifyContent: 'center' }}><ActivityIndicator color={C.accent} /></View>;
   if (!user) return <Redirect href="/login" />;
+  if (user.kyc_status === 'none' || user.kyc_status === 'rejected') return <Redirect href="/kyc" />;
   return (
     <Tabs
       screenOptions={{

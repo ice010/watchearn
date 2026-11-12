@@ -15,6 +15,7 @@ export default function RootLayout() {
           <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: C.bg } }}>
             <Stack.Screen name="(tabs)" />
             <Stack.Screen name="login" />
+            <Stack.Screen name="kyc" />
             <Stack.Screen name="watch/[id]" options={{ presentation: 'fullScreenModal' }} />
           </Stack>
         </RewardProvider>

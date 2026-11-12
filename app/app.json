@@ -50,6 +50,14 @@
           "userTrackingUsageDescription": "This lets us show you more relevant ads, which increases how much you earn."
         }
       ],
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "WatchEarn uses the camera to photograph your ID and take a selfie for identity verification.",
+          "photosPermission": "WatchEarn lets you upload a photo of your ID for identity verification.",
+          "microphonePermission": false
+        }
+      ],
       "expo-build-properties"
     ],
     "experiments": {

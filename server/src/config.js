@@ -6,6 +6,8 @@ const num = (v, d) => (v === undefined || v === '' ? d : Number(v));
 const config = {
   port: num(process.env.PORT, 4000),
   dbPath: process.env.DB_PATH || './data/watchearn.db',
+  // ID document and selfie images. Keep on encrypted, private storage in production.
+  kycDir: process.env.KYC_DIR || './data/kyc',
   jwtSecret: process.env.JWT_SECRET || 'dev-only-change-me',
   adminToken: process.env.ADMIN_TOKEN || '',
   publicUrl: process.env.PUBLIC_URL || 'http://localhost:4000',

@@ -68,7 +68,16 @@ export default function WalletScreen() {
         </View>
 
         <Text style={styles.h2}>Cash out</Text>
-        {!user?.phone_verified ? <PhoneVerify /> : (<>
+        {user?.kyc_status !== 'approved' ? (
+          <View style={[styles.balanceCard, { borderColor: C.gold }]}>
+            <Text style={{ color: C.text, fontWeight: '800', fontSize: 16 }}>Identity verification {user?.kyc_status === 'pending' ? 'in review' : 'required'}</Text>
+            <Text style={styles.muted}>
+              {user?.kyc_status === 'pending'
+                ? 'We are checking your ID and selfie. Cash out unlocks once you are approved. You can keep watching and earning meanwhile.'
+                : 'Verify your identity with an ID and a selfie to unlock cash out.'}
+            </Text>
+          </View>
+        ) : !user?.phone_verified ? <PhoneVerify /> : (<>
         <Text style={[styles.muted, { marginBottom: 10 }]}>Verified phone: {user.phone}</Text>
         <View style={styles.methods}>
           {METHODS.map((m) => (

@@ -12,6 +12,8 @@ server/  Express API: auth, points ledger, AdMob SSV rewards, withdrawals, payou
 - **Sign-up:** the user must enter a 6-digit code that is emailed to them. No token is issued until `POST /api/auth/verify-email` succeeds. Signing in with an unverified email sends a new code.
 - **Before the first withdrawal:** the user must verify a phone number (international format, e.g. `+255712345678`) with a code sent by **WhatsApp or SMS**. Each number can be verified on only one account, and mobile-money payouts go only to the verified number.
 - **Codes:** each code expires after 10 minutes and allows at most 5 attempts. A new code can be requested after 60 seconds. Codes are stored as HMAC hashes, not plain text.
+- **Identity verification (KYC):** works like Binance. Right after verifying their email, a new user must choose an ID type (national ID, passport or driver's licence) and enter their details (18+ only). They then photograph the ID front and back and take a **live selfie** while doing a random gesture shown on screen, such as "touch your left ear". Until they submit, the user cannot get past this screen. Cash-out stays locked until an admin approves. The same ID number cannot be used on a second account. Images are stored in `KYC_DIR`, which defaults to `server/data/kyc`, with owner-only file permissions.
+- **Automated face match / liveness:** to remove manual review, connect a KYC provider such as Sumsub, Onfido, Veriff or Smile ID (Africa coverage). Call it from `POST /api/kyc` and set the status from the provider's webhook.
 - **Sandbox (`MESSAGING_MODE=sandbox`):** codes are not sent. They are logged on the server and shown in the app so you can test the flow.
 
 ## How earning works
@@ -68,6 +70,11 @@ Apple may reject apps that pay cash for watching ads (Guideline 3.2.2). Present 
 
 ```bash
 curl -H "x-admin-token: $ADMIN_TOKEN" https://api.your-domain.com/api/admin/withdrawals
+# KYC review
+curl -H "x-admin-token: $ADMIN_TOKEN" https://api.your-domain.com/api/admin/kyc
+curl -H "x-admin-token: $ADMIN_TOKEN" https://api.your-domain.com/api/admin/kyc/1/selfie -o selfie.jpg   # front | back | selfie
+curl -X POST -H "x-admin-token: $ADMIN_TOKEN" https://api.your-domain.com/api/admin/kyc/1/approve
+curl -X POST -H "x-admin-token: $ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"reason":"Blurry photo"}' https://api.your-domain.com/api/admin/kyc/1/reject
 curl -X POST -H "x-admin-token: $ADMIN_TOKEN" https://api.your-domain.com/api/admin/withdrawals/1/approve
 curl -X POST -H "x-admin-token: $ADMIN_TOKEN" https://api.your-domain.com/api/admin/withdrawals/1/reject
 ```

@@ -19,6 +19,7 @@ export type User = {
   email_verified: boolean;
   phone: string | null;
   phone_verified: boolean;
+  kyc_status: 'none' | 'pending' | 'approved' | 'rejected';
 };
 export type CodeSent = { sentTo: string; channel: 'email' | 'sms' | 'whatsapp'; devCode?: string };
 export type Wallet = { points: number; usd: number; adsToday: number; maxAdsPerDay: number };
